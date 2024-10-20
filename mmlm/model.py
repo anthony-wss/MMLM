@@ -22,6 +22,23 @@ class MMLM(nn.Module):
         visual_model=None,
         visual_adapter_config=None,
     ):
+        """
+            MMLM model class. The pad token is set to [EOS].
+
+            Parameters:
+
+            - audio_config(int OR str): Use an int to represent the number of layers of the discrete feature.
+                Use a str to represent the hf repo name for a continuous encoder.
+
+            - audio_adapter_config(str): The name of audio adapter in model weights dict.
+
+            - lm_config(str): hf repo name of the LLM.
+
+            Attributes:
+
+            - continue_audio_feature_type_ids(List[int]): Range of audio feature type ids. The right end number is not included.
+                E.g. [39456, 39556)
+        """
         super().__init__()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -71,10 +88,23 @@ class MMLM(nn.Module):
         self.discrete_visual_feature_type_ids = [base_discrete_visual_tag_id, base_discrete_visual_tag_id + 1024 * 10]
 
     def _setup_discrete_feature_weights(self, config, modality):
+        """ 
+            Add trainable parameters for the weights of each discrete feature layer.
+            Larger weights for early RVQ layer.
+        """
         learnable_weight_init = torch.arange(config, 0, step=-1).float().view(config, 1, 1)
         setattr(self, f"{modality}_learnable_weight", nn.Parameter(learnable_weight_init))
 
     def _setup_continuous_feature_processing(self, config, model, adapter_config, modality):
+        """
+            Add adapter for continuous feature.
+            
+            Parameters:
+
+            - config(str): The huggingface repo name of the feature encoder.
+
+            - adapter_config(str): The corresponding adapter name in "mmlm/embedder.py"
+        """
         model = model.to(self.device) if model is not None else AutoModel.from_pretrained(config)
         setattr(self, f"{modality}_model", model)
         setattr(
@@ -99,6 +129,11 @@ class MMLM(nn.Module):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        """
+            Parameters:
+
+            - labels(List[List[torch.LongTensor]]): Shape [batch_num, max_seq_len]
+        """
 
         output_attentions = output_attentions if output_attentions is not None else self.lm_model.config.output_attentions
         output_hidden_states = (
@@ -106,6 +141,7 @@ class MMLM(nn.Module):
         )
         return_dict = return_dict if return_dict is not None else self.lm_model.config.use_return_dict
 
+        # The inputs need to be tokenized.
         if inputs_embeds is None:
             embeder = self.lm_model.get_input_embeddings()
             inputs_embeds = []
@@ -115,37 +151,58 @@ class MMLM(nn.Module):
                 text_ids = []
                 input_embeds = []
                 for i in batch_input:
+
+                    # case 1: `i` is discrete audio token
                     if self.discrete_audio_feature_type_ids[0] < i < self.discrete_audio_feature_type_ids[1]:
                         audio_discrete_token.append(i)
+
+                        # Clear text_ids by appending it to `input_embeds`.
                         if text_ids:
                             input_embeds.append(embeder(torch.LongTensor(text_ids).to(self.device)))
                         text_ids = []
+
+                    # case 2: `i` is discrete visual token
                     elif self.discrete_visual_feature_type_ids[0] < i < self.discrete_visual_feature_type_ids[1]:
                         visual_discrete_token.append(i)
+
+                        # Clear text_ids by appending it to `input_embeds`.
                         if text_ids:
                             input_embeds.append(embeder(torch.LongTensor(text_ids).to(self.device)))
                         text_ids = []
+
+                    # case 3: `i` is text token
                     else:
                         text_ids.append(i)
                         if len(audio_discrete_token) > 0:
+
+                            # Truncate audio_discrete_token to a multiple of self.audio_config
                             audio_discrete_token = audio_discrete_token[
                                 :len(audio_discrete_token) // self.audio_config * self.audio_config
                             ]
+
+                            # (N, ) -> (self.audio_config, L)
                             discrete_audio_input_id = torch.tensor(audio_discrete_token, dtype=torch.long).view(
                                 self.audio_config, -1
                             )
+
                             discrete_audio_input_ids = []
+                            # Embed the discrete audio input layer by layer
                             for i in range(self.audio_config):
                                 input_scale = embeder(discrete_audio_input_id[i, :].to(self.device))
                                 discrete_audio_input_ids.append(input_scale)
+
+                            # Weighted sum. Larger weight for early layer.
                             weighted_discrete_inputs_embeds = torch.mul(
                                 torch.stack(discrete_audio_input_ids, dim=0).to(self.device),
                                 F.softmax(self.audio_learnable_weight, dim=0).to(self.device)
                             )
                             weighted_discrete_inputs_embeds = torch.sum(weighted_discrete_inputs_embeds, dim=0)
+
                             if discrete_audio_input_ids:
                                 input_embeds.append(weighted_discrete_inputs_embeds)
                             audio_discrete_token = []
+
+                        # Simiar to audio token, but visual token is not hierarchical
                         elif len(visual_discrete_token) > 0:
                             discrete_visual_input_id = torch.tensor(visual_discrete_token).view(self.visual_config, -1)
                             discrete_visual_input_ids = []
@@ -176,6 +233,8 @@ class MMLM(nn.Module):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
             )
+
+        # Single batch of input_embeds is given. No tokenization needed.
         elif input_ids.shape[-1] == 1:
             outputs = self.lm_model(
                 input_ids=input_ids,
@@ -184,6 +243,8 @@ class MMLM(nn.Module):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
             )
+
+        # What is this case for?
         elif self.audio_config or self.visual_config:
             for batch_num, batch_input in enumerate(input_ids):
                 vision_features_id = 0
@@ -210,14 +271,17 @@ class MMLM(nn.Module):
                 return_dict=return_dict,
             )
 
+        # Shape of `logits`: [batch_size, num_token, num_classes]
         logits = outputs[0]
 
         loss = None
         if labels is not None:
-            loss_fct = CrossEntropyLoss()
+            shift_logits = logits.reshape(-1, logits.size(-1)) # Shape: [batch_size * num_token, num_classes]
+            
             labels = labels[:, -logits.shape[1]:]
-            shift_logits = logits.reshape(-1, logits.size(-1))
-            shift_labels = labels.reshape(-1)
+            shift_labels = labels.reshape(-1) # Shape: [batch_size * num_token]
+
+            loss_fct = CrossEntropyLoss()
             loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
@@ -231,6 +295,7 @@ class MMLM(nn.Module):
         )
 
     def generate(self, input_ids, audio_feature=None, max_length=50):
+        """ Greedy decoding. """
         self.eval()
         generated = input_ids.to(self.device)
         begin_gen_pos = input_ids.shape[1]

@@ -7,6 +7,7 @@ class MMLMUtility():
         self.mmlm_model = mmlm_model
 
     def tokenize_function(self, examples):
+        """ The map function for dataset `voidful/cv_13_tw_speech_tokenizer_asr` """
         model_inputs = self.mmlm_model.tokenizer(examples['input'] + examples['label'])
         labels = self.mmlm_model.tokenizer(examples['label'] + self.mmlm_model.tokenizer.eos_token)
         padding_size = len(model_inputs['input_ids']) - len(labels["input_ids"])
@@ -18,6 +19,7 @@ class MMLMUtility():
             self.tokenizer = tokenizer
 
         def __call__(self, features):
+            """ Pad the batched inputs """
             return {
                 'input_ids': pad_sequence([torch.tensor(i['input_ids']) for i in features], batch_first=True,
                                           padding_value=self.tokenizer.eos_token_id),
