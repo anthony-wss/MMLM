@@ -4,7 +4,7 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 from transformers import AutoModelForCausalLM, AutoModel, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from embedder import export_embedder
+from mmlm.embedder import export_embedder
 import torch
 import torch.nn.functional as F
 
@@ -12,7 +12,7 @@ import torch.nn.functional as F
 class MMLM(nn.Module):
     def __init__(
         self,
-        lm_config,
+        lm_config=None,
         lm_model=None,
         lm_tokenizer=None,
         audio_config=1,
@@ -39,6 +39,8 @@ class MMLM(nn.Module):
             - continue_audio_feature_type_ids(List[int]): Range of audio feature type ids. The right end number is not included.
                 E.g. [39456, 39556)
         """
+        if lm_config is None and lm_model is None:
+            raise TypeError("Either `lm_config` or `lm_model` should be provided.")
         super().__init__()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
